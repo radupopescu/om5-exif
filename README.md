@@ -31,8 +31,13 @@ output is unchanged.
 ./om5-exif-update.py -o out DIR_OR_FILE  # choose output directory
 ```
 
-Directories are searched recursively for `.orf`, `.jpg` and `.jpeg`. Files that
-are not OM-5 Mark II raw files are skipped, which makes re-runs safe.
+Directories are searched recursively for `.orf`. Output paths mirror the input
+tree beneath the output directory, relative to the common root of the supplied
+paths. `--in-place` keeps one `<file>.orig` backup per file (never overwritten)
+and leaves sidecars untouched; otherwise the original is left alone and matching
+`NAME.orf.xmp` / `NAME.xmp` sidecars are copied next to the output file. Files
+that are not OM-5 Mark II raw files are skipped, which makes re-runs safe; read
+or write failures are counted and cause a non-zero exit.
 
 Requires Python 3 only; no third-party packages.
 

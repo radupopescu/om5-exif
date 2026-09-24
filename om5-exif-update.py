@@ -27,6 +27,20 @@ Options:
     -o DIR        write results into DIR (default: ./om5-converted)
     --in-place    edit the originals, keeping a <file>.orig backup
     -n, --dry-run report what would change, write nothing
+
+Conventions:
+    Only .orf files are collected. When a directory is given it is searched
+    recursively; output paths mirror the input tree, relative to the common
+    root of the supplied paths, beneath the output directory.
+
+    --in-place edits each original and leaves a single <file>.orig backup
+    (never overwritten once it exists). XMP sidecars stay next to the
+    original and are not copied.
+
+    Without --in-place the original is left untouched and written to the
+    output directory. Any matching XMP sidecar (NAME.orf.xmp or NAME.xmp) is
+    copied alongside the output file. Sidecars are not detected or copied in
+    the other direction, and unrelated sidecars are ignored.
 """
 
 import argparse
@@ -39,19 +53,16 @@ SRC_MODEL = "OM-5MarkII"
 SRC_CAMTYPE = "S0130"
 DST_MODEL = "OM-5"
 DST_CAMTYPE = "S0101"
-DST_MAKE = "OM Digital Solutions"
 
 MODEL_TAG = 0x0110
-MAKE_TAG = 0x010F
 EXIF_IFD_TAG = 0x8769
 MAKERNOTE_TAG = 0x927C
 
-ASCII = 2
 ORF_MAGIC = 0x4F52  # "RO" little-endian, ORF files use this instead of 42
 
 
 def parse_ifd(data, base, endian):
-    """Yield (tag, typ, count, value_field_pos, entry_pos) for each entry."""
+    """Return (tag, typ, count, value_field_pos, entry_pos) for each entry."""
     if base + 2 > len(data):
         return []
     (n,) = struct.unpack_from(endian + "H", data, base)
@@ -75,7 +86,7 @@ def tag_value(data, typ, count, value_pos, endian):
 
 
 def find_identity(data):
-    """Locate the Model/ Make IFD0 entries and the MakerNote region.
+    """Locate the Model IFD0 entry and the MakerNote region.
 
     Returns a dict with the byte offsets needed to patch, or raises ValueError.
     """
@@ -91,16 +102,12 @@ def find_identity(data):
         raise ValueError("unexpected TIFF magic 0x%04x" % magic)
 
     (ifd0,) = struct.unpack_from(endian + "I", data, 4)
-    ifd0_entries = parse_ifd(data, ifd0, endian)
-
     info = {"endian": endian}
 
-    for tag, typ, count, vpos, epos in ifd0_entries:
-        off, size = tag_value(data, typ, count, vpos, endian)
+    for tag, typ, count, vpos, epos in parse_ifd(data, ifd0, endian):
         if tag == MODEL_TAG:
-            info["model"] = (off, size, count, epos)
-        elif tag == MAKE_TAG:
-            info["make"] = (off, size, count, epos)
+            off, size = tag_value(data, typ, count, vpos, endian)
+            info["model"] = (off, size, epos)
         elif tag == EXIF_IFD_TAG:
             (sub,) = struct.unpack_from(endian + "I", data, vpos)
             for t, ty, c, vp, ep in parse_ifd(data, sub, endian):
@@ -119,19 +126,13 @@ def patch(data, info):
     """Apply the relabel to a mutable bytearray. Returns a list of changes."""
     changes = []
 
-    moff, msize, mcount, mepos = info["model"]
+    moff, msize, mepos = info["model"]
     current = data[moff:moff + len(SRC_MODEL)]
     if current != SRC_MODEL.encode():
         got = data[moff:moff + msize].split(b"\x00", 1)[0].decode("ascii", "replace")
         raise ValueError(
             "Model is %r, not %r (already converted?)" % (got, SRC_MODEL)
         )
-
-    if "make" in info:
-        aoff, asize, acount, aepos = info["make"]
-        make = data[aoff:aoff + asize].rstrip(b"\x00 ").decode("ascii", "replace")
-        if make and make != DST_MAKE:
-            changes.append("Make   %r -> %r" % (make, DST_MAKE))
 
     # Model: write DST + NUL and update the IFD entry count; clear the old slot.
     data[moff:moff + msize] = b"\x00" * msize
@@ -161,7 +162,25 @@ def patch(data, info):
     return changes
 
 
+def sidecars(path):
+    """Existing XMP sidecars for a raw file: NAME.orf.xmp and NAME.xmp."""
+    candidates = [path + ".xmp", os.path.splitext(path)[0] + ".xmp"]
+    return [c for c in candidates if os.path.isfile(c)]
+
+
+def dest_sidecar(path, dest, sc):
+    """Map a source sidecar path to its counterpart next to dest."""
+    if sc == path + ".xmp":
+        return dest + ".xmp"
+    return os.path.splitext(dest)[0] + ".xmp"
+
+
 def process(path, dest, in_place, dry_run):
+    """Relabel one file. Returns True if a change was (or would be) made.
+
+    Raises ValueError for files that are not OM-5 Mark II ORFs and OSError for
+    read or write failures.
+    """
     with open(path, "rb") as fh:
         original = fh.read()
 
@@ -171,14 +190,14 @@ def process(path, dest, in_place, dry_run):
 
     if bytes(buf) == original:
         print("unchanged %s" % path)
-        return 0
+        return False
 
     print("rewrite %s" % path)
     for c in changes:
         print("        %s" % c)
 
     if dry_run:
-        return 1
+        return True
 
     if in_place:
         backup = path + ".orig"
@@ -191,20 +210,35 @@ def process(path, dest, in_place, dry_run):
         shutil.copy2(path, dest)
         with open(dest, "wb") as fh:
             fh.write(buf)
-    return 1
+        for sc in sidecars(path):
+            shutil.copy2(sc, dest_sidecar(path, dest, sc))
+    return True
 
 
 def collect(paths):
+    """Expand directories into their .orf files; pass other paths through."""
     out = []
     for p in paths:
         if os.path.isdir(p):
             for root, _, files in os.walk(p):
                 for name in files:
-                    if name.lower().endswith((".orf", ".jpg", ".jpeg")):
+                    if name.lower().endswith(".orf"):
                         out.append(os.path.join(root, name))
         else:
             out.append(p)
     return out
+
+
+def output_base(paths):
+    """Common root of the supplied paths, for mirroring the input tree."""
+    absolute = [os.path.abspath(p) for p in paths]
+    try:
+        base = os.path.commonpath(absolute)
+    except ValueError:
+        base = os.path.dirname(absolute[0])
+    if os.path.isfile(base):
+        base = os.path.dirname(base)
+    return base
 
 
 def main():
@@ -226,32 +260,42 @@ def main():
         print("no files found", file=sys.stderr)
         return 1
 
-    done = skipped = failed = 0
+    base = output_base(args.paths)
+
+    written = unchanged = skipped = failed = 0
     for path in files:
         try:
             with open(path, "rb") as fh:
                 head = fh.read(4)
-            if len(head) < 4 or head[:2] not in (b"II", b"MM"):
-                print("skip    %s (not TIFF/ORF)" % path)
-                skipped += 1
-                continue
         except OSError as exc:
-            print("skip    %s (%s)" % (path, exc))
+            print("fail    %s (%s)" % (path, exc))
+            failed += 1
+            continue
+
+        if len(head) < 4 or head[:2] not in (b"II", b"MM"):
+            print("skip    %s (not TIFF/ORF)" % path)
             skipped += 1
             continue
 
         dest = path if args.in_place else os.path.join(
-            args.out, os.path.relpath(path)
+            args.out, os.path.relpath(os.path.abspath(path), base)
         )
         try:
-            done += process(path, dest, args.in_place, args.dry_run)
+            if process(path, dest, args.in_place, args.dry_run):
+                written += 1
+            else:
+                unchanged += 1
         except ValueError as exc:
             print("skip    %s (%s)" % (path, exc))
             skipped += 1
+        except OSError as exc:
+            print("fail    %s (%s)" % (path, exc))
+            failed += 1
 
     verb = "would rewrite" if args.dry_run else ("rewrote" if args.in_place else "wrote")
-    print("\n%s %d file(s), %d skipped, %d failed" % (verb, done, skipped, failed))
-    return 0
+    print("\n%s %d, unchanged %d, skipped %d, failed %d"
+          % (verb, written, unchanged, skipped, failed))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
