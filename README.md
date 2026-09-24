@@ -1,4 +1,4 @@
-# om5-markii-to-marki
+# om5-exif-update
 
 Relabels an OM System OM-5 Mark II raw file (`.ORF`) as an original OM-5.
 
@@ -25,10 +25,10 @@ output is unchanged.
 ## Usage
 
 ```
-./om5-markii-to-marki.py RAW.ORF             # write converted copy to ./om5-converted/
-./om5-markii-to-marki.py --in-place RAW.ORF  # edit original, keep RAW.ORF.orig backup
-./om5-markii-to-marki.py -n RAW.ORF          # dry run, report changes only
-./om5-markii-to-marki.py -o out DIR_OR_FILE  # choose output directory
+./om5-exif-update.py RAW.ORF             # write converted copy to ./om5-converted/
+./om5-exif-update.py --in-place RAW.ORF  # edit original, keep RAW.ORF.orig backup
+./om5-exif-update.py -n RAW.ORF          # dry run, report changes only
+./om5-exif-update.py -o out DIR_OR_FILE  # choose output directory
 ```
 
 Directories are searched recursively for `.orf`, `.jpg` and `.jpeg`. Files that

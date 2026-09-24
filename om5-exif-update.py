@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-om5-markii-to-marki.py
+om5-exif-update.py
 
 Relabel an OM System OM-5 Mark II raw file (ORF) as a plain OM-5 so that
 imaging software predating the Mark II will accept it.
@@ -19,9 +19,9 @@ No offsets change and no image or preview data is touched. The output is
 exactly the same size as the input.
 
 Usage:
-    ./om5-markii-to-marki.py FILE_OR_DIR [FILE_OR_DIR ...]
-    ./om5-markii-to-marki.py --in-place FILE_OR_DIR ...
-    ./om5-markii-to-marki.py --dry-run FILE_OR_DIR ...
+    ./om5-exif-update.py FILE_OR_DIR [FILE_OR_DIR ...]
+    ./om5-exif-update.py --in-place FILE_OR_DIR ...
+    ./om5-exif-update.py --dry-run FILE_OR_DIR ...
 
 Options:
     -o DIR        write results into DIR (default: ./om5-converted)
