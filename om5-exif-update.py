@@ -3,28 +3,35 @@
 om5-exif-update.py
 
 Relabel an OM System OM-5 Mark II raw file (ORF) as a plain OM-5 so that
-imaging software predating the Mark II will accept it.
+imaging software predating the Mark II will accept it, or revert that
+change with 1to2 mode.
 
 The Mark II and the original OM-5 share the same sensor and ORF container.
 Capture One and similar tools choose a camera profile from the recorded
 camera identity, so changing that identity is usually enough.
 
 The two identity fields are rewritten in place, byte for byte, without
-moving anything else in the file:
+moving anything else in the file. 2to1 (the default) applies:
 
     IFD0:Model            "OM-5MarkII"  ->  "OM-5"     (IFD entry count 17 -> 5)
     Olympus:CameraType2   "S0130"       ->  "S0101"    (same length)
 
-No offsets change and no image or preview data is touched. The output is
-exactly the same size as the input.
+1to2 applies the exact reverse. No offsets change and no image or preview
+data is touched. The output is exactly the same size as the input, and a
+2to1 followed by a 1to2 reproduces the original bytes.
 
 Usage:
     ./om5-exif-update.py FILE_OR_DIR [FILE_OR_DIR ...]
+    ./om5-exif-update.py --mode 1to2 FILE_OR_DIR ...
     ./om5-exif-update.py --in-place FILE_OR_DIR ...
     ./om5-exif-update.py --dry-run FILE_OR_DIR ...
 
 Options:
-    -o DIR        write results into DIR (default: ./om5-converted)
+    --mode {2to1,1to2}
+                  2to1 relabel Mark II files as OM-5 (default); 1to2 revert
+                  2to1-converted files back to Mark II
+    -o DIR        write results into DIR (default: ./om5-converted,
+                  or ./om5-restored in 1to2 mode)
     --in-place    edit the originals, keeping a <file>.orig backup
     -n, --dry-run report what would change, write nothing
 
@@ -41,6 +48,20 @@ Conventions:
     output directory. Any matching XMP sidecar (NAME.orf.xmp or NAME.xmp) is
     copied alongside the output file. Sidecars are not detected or copied in
     the other direction, and unrelated sidecars are ignored.
+
+    1to2 only touches files that carry the signature a 2to1 conversion
+    leaves behind: Model "OM-5" with entry count 5, followed by zero
+    padding from the old 17-byte "OM-5MarkII" slot, and exactly one "S0101"
+    in the MakerNote. Anything else that reads as OM-5/S0101 is skipped,
+    which keeps genuine OM-5 files safe in the common case; a genuine OM-5
+    whose Model string happens to be followed by six or more zero bytes
+    cannot be told apart from a converted file without samples of both
+    bodies and would be reverted too.
+
+    In 1to2 --in-place mode, when a <file>.orig backup from the original
+    2to1 run exists it is compared against the expected result: on a
+    byte-identical match the written file equals that backup, and a
+    mismatching backup is reported and never copied over the file.
 """
 
 import argparse
@@ -49,10 +70,14 @@ import shutil
 import struct
 import sys
 
-SRC_MODEL = "OM-5MarkII"
-SRC_CAMTYPE = "S0130"
-DST_MODEL = "OM-5"
-DST_CAMTYPE = "S0101"
+MODES = {
+    "2to1": {"src_model": "OM-5MarkII", "dst_model": "OM-5",
+             "src_camtype": "S0130", "dst_camtype": "S0101"},
+    "1to2": {"src_model": "OM-5", "dst_model": "OM-5MarkII",
+             "src_camtype": "S0101", "dst_camtype": "S0130"},
+}
+
+FORWARD_MODEL_SLOT = 17  # bytes Mark II files allocate to IFD0:Model
 
 MODEL_TAG = 0x0110
 EXIF_IFD_TAG = 0x8769
@@ -107,7 +132,7 @@ def find_identity(data):
     for tag, typ, count, vpos, epos in parse_ifd(data, ifd0, endian):
         if tag == MODEL_TAG:
             off, size = tag_value(data, typ, count, vpos, endian)
-            info["model"] = (off, size, epos)
+            info["model"] = (off, size, epos, count)
         elif tag == EXIF_IFD_TAG:
             (sub,) = struct.unpack_from(endian + "I", data, vpos)
             for t, ty, c, vp, ep in parse_ifd(data, sub, endian):
@@ -122,42 +147,72 @@ def find_identity(data):
     return info
 
 
-def patch(data, info):
+def patch(data, info, mode):
     """Apply the relabel to a mutable bytearray. Returns a list of changes."""
+    spec = MODES[mode]
     changes = []
 
-    moff, msize, mepos = info["model"]
-    current = data[moff:moff + len(SRC_MODEL)]
-    if current != SRC_MODEL.encode():
+    moff, msize, mepos, mcount = info["model"]
+    src = spec["src_model"].encode()
+    dst = spec["dst_model"].encode()
+
+    if data[moff:moff + len(src)] != src:
         got = data[moff:moff + msize].split(b"\x00", 1)[0].decode("ascii", "replace")
+        hint = " (already converted?)" if mode == "2to1" else ""
         raise ValueError(
-            "Model is %r, not %r (already converted?)" % (got, SRC_MODEL)
+            "Model is %r, not %r%s" % (got, spec["src_model"], hint)
         )
 
-    # Model: write DST + NUL and update the IFD entry count; clear the old slot.
-    data[moff:moff + msize] = b"\x00" * msize
-    new = DST_MODEL.encode() + b"\x00"
-    data[moff:moff + len(new)] = new
-    struct.pack_into(info["endian"] + "I", data, mepos + 4, len(new))
-    changes.append("Model  %r -> %r" % (SRC_MODEL, DST_MODEL))
+    if mode == "2to1":
+        # Model: write DST + NUL and update the IFD entry count; clear the old slot.
+        data[moff:moff + msize] = b"\x00" * msize
+        new = dst + b"\x00"
+        data[moff:moff + len(new)] = new
+        struct.pack_into(info["endian"] + "I", data, mepos + 4, len(new))
+    else:
+        # The forward patch left "OM-5\0" followed by zero padding from the
+        # old "OM-5MarkII" slot. Rewrite only bytes inside that padded slot;
+        # require enough padding for "MarkII\0" so that a genuine OM-5 whose
+        # Model value is immediately followed by live data is left alone.
+        if mcount != len(src) + 1:
+            raise ValueError(
+                "Model entry count is %d, not %d (not a converted file?)"
+                % (mcount, len(src) + 1)
+            )
+        cap = FORWARD_MODEL_SLOT - (len(src) + 1)
+        run = 0
+        while (run < cap and moff + len(src) + 1 + run < len(data)
+               and data[moff + len(src) + 1 + run] == 0):
+            run += 1
+        if run < len(dst) - len(src):
+            raise ValueError(
+                "Model is %r but is not followed by zero padding "
+                "(genuine OM-5, not a converted file?)" % spec["src_model"]
+            )
+        slot = len(src) + 1 + run
+        data[moff:moff + slot] = dst + b"\x00" * (slot - len(dst))
+        struct.pack_into(info["endian"] + "I", data, mepos + 4, slot)
+    changes.append("Model  %r -> %r" % (spec["src_model"], spec["dst_model"]))
 
     # CameraType2 inside the MakerNote: unique there, same length.
     moff, msize = info["makernote"]
     region = bytes(data[moff:moff + msize])
     hits = []
     start = 0
+    needle = spec["src_camtype"].encode()
     while True:
-        i = region.find(SRC_CAMTYPE.encode(), start)
+        i = region.find(needle, start)
         if i < 0:
             break
         hits.append(moff + i)
         start = i + 1
     if len(hits) != 1:
         raise ValueError(
-            "expected exactly one %r in MakerNote, found %d" % (SRC_CAMTYPE, len(hits))
+            "expected exactly one %r in MakerNote, found %d"
+            % (spec["src_camtype"], len(hits))
         )
-    data[hits[0]:hits[0] + len(SRC_CAMTYPE)] = DST_CAMTYPE.encode()
-    changes.append("CameraType2 %r -> %r" % (SRC_CAMTYPE, DST_CAMTYPE))
+    data[hits[0]:hits[0] + len(needle)] = spec["dst_camtype"].encode()
+    changes.append("CameraType2 %r -> %r" % (spec["src_camtype"], spec["dst_camtype"]))
 
     return changes
 
@@ -175,18 +230,19 @@ def dest_sidecar(path, dest, sc):
     return os.path.splitext(dest)[0] + ".xmp"
 
 
-def process(path, dest, in_place, dry_run):
+def process(path, dest, in_place, dry_run, mode):
     """Relabel one file. Returns True if a change was (or would be) made.
 
-    Raises ValueError for files that are not OM-5 Mark II ORFs and OSError for
-    read or write failures.
+    Raises ValueError for files that do not match the mode's expectations
+    (not a Mark II ORF for 2to1, not a converted ORF for 1to2) and OSError
+    for read or write failures.
     """
     with open(path, "rb") as fh:
         original = fh.read()
 
     info = find_identity(original)
     buf = bytearray(original)
-    changes = patch(buf, info)
+    changes = patch(buf, info, mode)
 
     if bytes(buf) == original:
         print("unchanged %s" % path)
@@ -201,6 +257,14 @@ def process(path, dest, in_place, dry_run):
 
     if in_place:
         backup = path + ".orig"
+        if mode == "1to2" and os.path.exists(backup):
+            with open(backup, "rb") as fh:
+                backup_bytes = fh.read()
+            if backup_bytes == bytes(buf):
+                print("        matches existing %s" % backup)
+            else:
+                print("note    existing %s does not match this file's "
+                      "original Mark II state; re-patching anyway" % backup)
         if not os.path.exists(backup):
             shutil.copy2(path, backup)
         with open(path, "wb") as fh:
@@ -243,17 +307,24 @@ def output_base(paths):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Relabel OM-5 Mark II ORF files as OM-5.",
+        description="Relabel OM-5 Mark II ORF files as OM-5, "
+                    "or revert converted files back to Mark II.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("paths", nargs="+", help="files or directories")
-    ap.add_argument("-o", "--out", default="om5-converted",
-                    help="output directory (default: om5-converted)")
+    ap.add_argument("--mode", choices=("2to1", "1to2"), default="2to1",
+                    help="2to1 relabel Mark II files as OM-5 (default); "
+                         "1to2 revert 2to1-converted files back to Mark II")
+    ap.add_argument("-o", "--out", default=None,
+                    help="output directory (default: om5-converted for 2to1, "
+                         "om5-restored for 1to2)")
     ap.add_argument("--in-place", action="store_true",
                     help="edit originals, keeping .orig backups")
     ap.add_argument("-n", "--dry-run", action="store_true",
                     help="report changes without writing")
     args = ap.parse_args()
+
+    out_dir = args.out or ("om5-converted" if args.mode == "2to1" else "om5-restored")
 
     files = collect(args.paths)
     if not files:
@@ -278,10 +349,10 @@ def main():
             continue
 
         dest = path if args.in_place else os.path.join(
-            args.out, os.path.relpath(os.path.abspath(path), base)
+            out_dir, os.path.relpath(os.path.abspath(path), base)
         )
         try:
-            if process(path, dest, args.in_place, args.dry_run):
+            if process(path, dest, args.in_place, args.dry_run, args.mode):
                 written += 1
             else:
                 unchanged += 1
